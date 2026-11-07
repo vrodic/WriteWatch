@@ -54,7 +54,38 @@ WriteWatch asks for your administrator password when it opens, because per-file 
 | Top files and large-writes log | Yes | No |
 | RAM disk separation | Yes | No |
 
-A small helper runs as root only while the app is open. It does just one thing, relaying `fs_usage` output to the app over a local connection, and it exits when the app quits. Nothing stays installed, so the app asks each time you open it. For regular use, keep the app somewhere only administrators can write, such as `/Applications`, because the helper runs from inside the app bundle.
+## Why such a scary password prompt?
+
+Because macOS only has one size of prompt. All WriteWatch needs is the output of one built-in Apple tool:
+
+```bash
+sudo fs_usage -w -f diskio
+```
+
+`fs_usage` traces disk activity across every process, so macOS requires root to run it. There's no permission for "just this one tool", and no privacy setting that covers it. The only option is the standard administrator prompt, the same one used for any request to run something as root, however small.
+
+Your password goes to macOS, not to WriteWatch. The app asks the system to start the helper as root, and macOS shows the prompt and checks the password itself.
+
+### What the helper does
+
+`WriteWatchHelper` is the only part of WriteWatch that runs as root. It's about 150 lines of Swift in [`Sources/WriteWatchHelper/main.swift`](Sources/WriteWatchHelper/main.swift), so you can read all of it in a few minutes.
+
+1. It connects back to the app on `127.0.0.1` and identifies itself with a one-time token.
+2. When the app starts a capture, it runs `/usr/bin/fs_usage -w -f diskio` and sends the output to the app. The command is fixed in the code, so the app can't ask it to run anything else.
+3. If `fs_usage` passes the memory limit, it restarts it.
+4. When the connection closes, including if the app crashes, it stops the trace and exits.
+
+It accepts only two commands from the app, start trace and stop trace. It only connects to your own Mac, it creates no files, and nothing stays installed afterward.
+
+### What to keep in mind
+
+- **It really does run as root.** macOS doesn't confine it to these actions; the limits come from what its code does. That's why it's kept small enough to read.
+- **The trace covers the whole system.** File paths from every process pass through the helper to the app, and stay on your Mac unless you save them.
+- **Keep the app somewhere safe.** The helper runs from inside the app bundle, so another program running under your account could swap it out before you approve the prompt. For regular use, put the app somewhere only administrators can write, such as `/Applications`.
+
+### Why it asks every time
+
+An installed background helper could skip the prompt, but it would need a signed release and would leave a root service on your Mac full time. WriteWatch runs as root only while it's open and leaves nothing behind, at the cost of one prompt per launch.
 
 ## Good to know
 
