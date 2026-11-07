@@ -669,15 +669,26 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     func loadReplay(path: String) {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
         access = .granted
+        var bytesPerSecond: [Int: Double] = [:]
         for line in text.split(separator: "\n") {
-            if let write = FSUsageParser.parse(String(line)) {
-                store.ingest(write, onRAMDisk: classifier.isRAMDisk(write.device))
+            guard let write = FSUsageParser.parse(String(line)) else { continue }
+            let onRAMDisk = classifier.isRAMDisk(write.device)
+            store.ingest(write, onRAMDisk: onRAMDisk)
+            let clock = write.timestamp.prefix(8).split(separator: ":").compactMap { Int($0) }
+            if !onRAMDisk, clock.count == 3 {
+                bytesPerSecond[clock[0] * 3600 + clock[1] * 60 + clock[2], default: 0] += Double(write.bytes)
             }
         }
-        peakRate = 1_200_000
-        captureDiskBytes = 152_092_672
-        captureSeconds = 300
-        for i in 0..<120 { chart.append(Double(abs((i * 37) % 11 == 0 ? 900_000 : (i * 13) % 180_000))) }
+        // Shows the recording's busiest two minutes, at the rates it actually had.
+        let window = 120
+        let start = bytesPerSecond.keys.max { first, second in
+            let total = { (from: Int) in (from..<(from + window)).reduce(0.0) { $0 + (bytesPerSecond[$1] ?? 0) } }
+            return total(first) < total(second)
+        } ?? 0
+        for second in start..<(start + window) { chart.append(bytesPerSecond[second] ?? 0) }
+        peakRate = bytesPerSecond.values.max() ?? 0
+        captureDiskBytes = UInt64(bytesPerSecond.values.reduce(0, +))
+        captureSeconds = Double((bytesPerSecond.keys.max() ?? 0) - (bytesPerSecond.keys.min() ?? 0))
         updateControls()
     }
 
