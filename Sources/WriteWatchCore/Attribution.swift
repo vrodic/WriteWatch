@@ -10,7 +10,8 @@ public enum Attribution {
     public static let metadataOwner = "Filesystem metadata"
     public static let unattributedOwner = "Unattributed (flushed by launchd)"
 
-    private static let flushers: Set<String> = ["launchd", "kernel_task"]
+    /// Processes that push other programs' pending data to disk, and get charged for it.
+    private static let flushers: Set<String> = ["launchd", "kernel_task", "sync"]
 
     public static func isFlusher(_ process: String) -> Bool {
         flushers.contains(process)

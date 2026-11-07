@@ -9,6 +9,7 @@ final class LogPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private enum Column: String, CaseIterable {
         case time = "Time"
         case size = "Size"
+        case storage = "Storage"
         case app = "App"
         case process = "Issued by"
         case path = "File"
@@ -17,9 +18,10 @@ final class LogPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
             switch self {
             case .time: return 108
             case .size: return 72
+            case .storage: return 70
             case .app: return 150
             case .process: return 120
-            case .path: return 460
+            case .path: return 400
             }
         }
     }
@@ -95,6 +97,11 @@ final class LogPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         switch column {
         case .time: field.stringValue = String(entry.write.timestamp.prefix(12))
         case .size: field.stringValue = ByteFormat.string(entry.write.bytes)
+        case .storage:
+            field.stringValue = entry.onRAMDisk ? "RAM disk" : "Disk"
+            field.textColor = entry.onRAMDisk ? .labelColor : .secondaryLabelColor
+            field.toolTip = entry.onRAMDisk
+                ? "On \(entry.write.device), a RAM disk. This write never reached the SSD." : "On \(entry.write.device)"
         case .app: field.stringValue = entry.owner
         case .process: field.stringValue = entry.write.process
         case .path:

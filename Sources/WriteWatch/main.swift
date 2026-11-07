@@ -107,6 +107,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if DEBUG
+if let index = CommandLine.arguments.firstIndex(of: "--classify") {
+    for device in CommandLine.arguments[(index + 1)...] {
+        print("\(device): \(DeviceClassifier.queryIsRAMDisk(device) ? "RAM disk" : "not a RAM disk")")
+    }
+    exit(0)
+}
+#endif
+
 let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate

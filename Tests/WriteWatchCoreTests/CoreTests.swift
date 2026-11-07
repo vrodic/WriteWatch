@@ -15,6 +15,7 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(write.path, "/private/var/db/x.tracev3")
         XCTAssertEqual(write.process, "launchd")
         XCTAssertEqual(write.threadID, "1815995")
+        XCTAssertEqual(write.device, "disk3s5")
     }
 
     func testHandlesSpacesInPathAndProcessName() throws {
@@ -61,6 +62,13 @@ final class AttributionTests: XCTestCase {
         XCTAssertEqual(Attribution.owner(process: "launchd", path: "/weird", seenWriter: nil), Attribution.unattributedOwner)
     }
 
+    func testSyncCommandIsTreatedAsAFlusher() {
+        XCTAssertEqual(Attribution.owner(process: "sync", path: "/x", seenWriter: "biomesyncd"), "biomesyncd")
+        XCTAssertEqual(
+            Attribution.owner(process: "sync", path: "/private/var/db/diagnostics/Persist/1.tracev3", seenWriter: nil),
+            "logd (system log)")
+    }
+
     func testLaunchdOwnLogAndMetadata() {
         XCTAssertEqual(
             Attribution.owner(process: "launchd", path: "/private/var/log/com.apple.xpc.launchd/launchd.log", seenWriter: nil),
@@ -93,6 +101,43 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(snapshot.apps.first?.name, "firefox")
         XCTAssertEqual(snapshot.apps.first?.bytes, 100)
         XCTAssertEqual(snapshot.flushedBytes, 90)
+    }
+
+    func testRAMDiskWritesStayOutOfDiskRankings() {
+        let store = CaptureStore(threshold: 1)
+        store.ingest(write(900, "SC2", path: "/Volumes/SC2tmp/a"), onRAMDisk: true)
+        store.ingest(write(100, "SC2", path: "/Users/v/real"))
+        store.ingest(write(50, "other", path: "/x"))
+        let snapshot = store.snapshot(top: 10)
+        XCTAssertEqual(snapshot.apps.map(\.name), ["SC2", "other"])
+        XCTAssertEqual(snapshot.apps.first?.bytes, 100)
+        XCTAssertEqual(snapshot.files.map(\.path), ["/Users/v/real", "/x"])
+        XCTAssertEqual(snapshot.ramApps.first?.bytes, 900)
+        XCTAssertEqual(snapshot.ramFiles.map(\.path), ["/Volumes/SC2tmp/a"])
+        XCTAssertEqual(snapshot.ramDiskBytes, 900)
+        XCTAssertEqual(snapshot.tracedBytes, 1050)
+    }
+
+    func testCSVMarksRAMDiskWrites() {
+        let store = CaptureStore(threshold: 1)
+        var onRAM = write(5, "SC2", path: "/Volumes/SC2tmp/a")
+        onRAM.device = "disk4"
+        store.ingest(onRAM, onRAMDisk: true)
+        store.ingest(write(5, path: "/b"))
+        let log = String(decoding: store.logCSV(), as: UTF8.self)
+        XCTAssertTrue(log.contains("\"RAM disk\",\"disk4\",\"SC2\""))
+        XCTAssertTrue(log.contains("\"Disk\""))
+        let totals = String(decoding: store.totalsCSV(), as: UTF8.self)
+        XCTAssertTrue(totals.contains("\"file\",\"RAM disk\",\"/Volumes/SC2tmp/a\""))
+    }
+
+    func testResetClearsRAMDiskTotals() {
+        let store = CaptureStore(threshold: 1)
+        store.ingest(write(5), onRAMDisk: true)
+        store.reset()
+        let snapshot = store.snapshot(top: 5)
+        XCTAssertEqual(snapshot.ramDiskBytes, 0)
+        XCTAssertTrue(snapshot.ramApps.isEmpty)
     }
 
     func testCountsOwnFilesFlushedByLaunchd() {

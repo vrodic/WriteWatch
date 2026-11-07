@@ -46,6 +46,47 @@ final class DiskCounters {
     }
 }
 
+/// Identifies RAM disks from the system's own description of a device, not from volume names.
+///
+/// A disk image's driver in the IORegistry records where the image lives: `ram://` for a RAM disk,
+/// or a real path for a file-backed image, whose writes do reach the disk behind it. Device names
+/// get reused after a disk is ejected, so `refresh()` should be called periodically.
+final class DeviceClassifier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var known: [String: Bool] = [:]
+
+    func isRAMDisk(_ device: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = known[device] { return cached }
+        let answer = Self.queryIsRAMDisk(device)
+        known[device] = answer
+        return answer
+    }
+
+    func refresh() {
+        lock.lock()
+        defer { lock.unlock() }
+        for device in known.keys { known[device] = Self.queryIsRAMDisk(device) }
+    }
+
+    static func queryIsRAMDisk(_ device: String) -> Bool {
+        guard !device.isEmpty, let matching = IOBSDNameMatching(kIOMainPortDefault, 0, device) else { return false }
+        let media = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard media != IO_OBJECT_NULL else { return false }
+        defer { IOObjectRelease(media) }
+
+        let options = IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents)
+        if let path = IORegistryEntrySearchCFProperty(media, kIOServicePlane, "image-path" as CFString, kCFAllocatorDefault, options) {
+            if let data = path as? Data { return String(decoding: data, as: UTF8.self).hasPrefix("ram://") }
+            if let text = path as? String { return text.hasPrefix("ram://") }
+        }
+        let characteristics = IORegistryEntrySearchCFProperty(
+            media, kIOServicePlane, "Protocol Characteristics" as CFString, kCFAllocatorDefault, options)
+        return (characteristics as? [String: Any])?["Physical Interconnect Location"] as? String == "RAM"
+    }
+}
+
 private func usage(of pid: pid_t) -> rusage_info_v2? {
     var info = rusage_info_v2()
     let result = withUnsafeMutablePointer(to: &info) {

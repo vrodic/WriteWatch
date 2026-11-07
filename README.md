@@ -7,7 +7,8 @@ Captures stay in memory until you choose to save them.
 ## Features
 
 - **Live write rate:** current speed, a 2-minute chart, the peak, and totals for the capture and since boot, from the drive's IOKit counters.
-- **Top writers:** apps and files ranked by bytes written.
+- **Top writers:** apps and files ranked by bytes written to real storage.
+- **RAM disk separation:** writes to RAM disks are detected and tracked apart, since they never reach the SSD.
 - **Large-writes log:** every write at or above a threshold you set, from 4 KB to 16 MB. It keeps the newest 200,000 entries.
 - **SSD health:** wear, spare capacity, media errors, temperature and lifetime totals, read from the drive's NVMe SMART log without `smartctl`.
 - **CSV export:** save the log or the app and file totals to a file you choose.
@@ -17,6 +18,14 @@ Captures stay in memory until you choose to save them.
 macOS tools often show `launchd` as a major disk writer. On the Mac this was built on, launchd issued a burst of writes exactly every 30 seconds, and nearly all of them went to other programs' files. That looks like a periodic flush of pending data, with launchd charged for the I/O.
 
 WriteWatch credits those writes to the program that was seen writing the same file, or failing that, to whatever the file's path suggests. This is a best guess. Anything unclear is listed as "Unattributed (flushed by launchd)", and the log shows both the credited app and the process that issued the write.
+
+## RAM disks
+
+Tools that report per-process writes count RAM disk writes as if they were disk writes, which can make an app look like a heavy SSD writer when it isn't. WriteWatch checks each device in the IORegistry: a disk image whose `image-path` starts with `ram://`, or whose protocol location is `RAM`, is a RAM disk. A file-backed disk image has a real path there and counts as disk, because its writes reach the disk behind it. Volume names are never used.
+
+RAM disk writes have their own tab and tile, and are excluded from the main rankings. An app that writes to both shows, for example, "+965 MB on RAM disk" on its row. The Large Writes log and both CSV exports have a storage column, and the log export also records the device.
+
+Without administrator access there's no per-device data, so RAM disk writes can't be separated and are included in the app totals.
 
 ## Requirements
 
@@ -55,6 +64,7 @@ At launch, the app asks for an administrator password through the standard macOS
 | SSD health | Yes | Yes |
 | Apps ranked by writes | All processes | Your own processes only |
 | Files ranked and large-writes log | Yes | No |
+| RAM disk separation | Yes | No |
 
 Per-file data comes from `fs_usage`, which requires root. A minimal helper, `WriteWatchHelper`, runs as root only while the app is open. It can start and stop one fixed `fs_usage` command and sends the output to the app over a loopback connection. It creates no files, and it exits when the connection closes. Nothing is installed permanently, so the app asks for the password on each launch.
 

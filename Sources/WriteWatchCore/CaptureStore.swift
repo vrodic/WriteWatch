@@ -3,6 +3,7 @@ import Foundation
 public struct LogEntry: Sendable {
     public let write: RawWrite
     public let owner: String
+    public let onRAMDisk: Bool
 }
 
 public struct RankedApp: Sendable {
@@ -19,9 +20,14 @@ public struct RankedFile: Sendable {
 }
 
 public struct CaptureSnapshot: Sendable {
+    /// Writes to real storage. RAM disk writes are kept apart, since they never reach the SSD.
     public let apps: [RankedApp]
     public let files: [RankedFile]
+    public let ramApps: [RankedApp]
+    public let ramFiles: [RankedFile]
+    /// Everything traced, including RAM disks.
     public let tracedBytes: Int
+    public let ramDiskBytes: Int
     public let writeCount: Int
     public let flushedBytes: Int
     public let logCount: Int
@@ -47,18 +53,41 @@ public final class CaptureStore: @unchecked Sendable {
         var owner = ""
     }
 
+    /// Per-app and per-file totals for one kind of storage.
+    private struct Ledger {
+        var apps: [String: Tally] = [:]
+        var files: [String: FileTally] = [:]
+
+        func rankedApps(top: Int) -> [RankedApp] {
+            Array(
+                apps
+                    .map { RankedApp(name: $0.key, bytes: $0.value.bytes, writes: $0.value.writes) }
+                    .sorted { ($0.bytes, $1.name) > ($1.bytes, $0.name) }
+                    .prefix(top))
+        }
+
+        func rankedFiles(top: Int) -> [RankedFile] {
+            Array(
+                files
+                    .map { RankedFile(path: $0.key, owner: $0.value.owner, bytes: $0.value.bytes, writes: $0.value.writes) }
+                    .sorted { ($0.bytes, $1.path) > ($1.bytes, $0.path) }
+                    .prefix(top))
+        }
+    }
+
     private let lock = NSLock()
     private let logCapacity: Int
     private let fileCapacity: Int
 
-    private var apps: [String: Tally] = [:]
-    private var files: [String: FileTally] = [:]
+    private var disk = Ledger()
+    private var ram = Ledger()
     private var directWriters: [String: String] = [:]
     private var log: [LogEntry] = []
     private var logStart = 0
     private var droppedLogEntries = 0
     private var droppedFileBytes = 0
     private var tracedBytes = 0
+    private var ramDiskBytes = 0
     private var writeCount = 0
     private var flushedBytes = 0
     private var ownFlushedBytes = 0
@@ -79,7 +108,7 @@ public final class CaptureStore: @unchecked Sendable {
         lock.withLock { threshold = bytes }
     }
 
-    public func ingest(_ write: RawWrite) {
+    public func ingest(_ write: RawWrite, onRAMDisk: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -92,48 +121,58 @@ public final class CaptureStore: @unchecked Sendable {
 
         tracedBytes += write.bytes
         writeCount += 1
+        if onRAMDisk { ramDiskBytes += write.bytes }
         if write.process == "launchd" { flushedBytes += write.bytes }
         if isFlusher, write.path.contains("local.writewatch.app") { ownFlushedBytes += write.bytes }
 
-        apps[owner, default: Tally()].bytes += write.bytes
-        apps[owner, default: Tally()].writes += 1
-
-        if !write.path.isEmpty {
-            var file = files[write.path] ?? FileTally()
-            file.bytes += write.bytes
-            file.writes += 1
-            file.owner = owner
-            files[write.path] = file
-            if files.count > fileCapacity { pruneFiles() }
+        if onRAMDisk {
+            record(write, owner: owner, in: &ram)
+        } else {
+            record(write, owner: owner, in: &disk)
         }
 
         if write.bytes >= threshold {
-            append(LogEntry(write: write, owner: owner))
+            append(LogEntry(write: write, owner: owner, onRAMDisk: onRAMDisk))
         }
     }
 
-    /// Without root, per-process counters are all that is available; there is no file detail.
+    private func record(_ write: RawWrite, owner: String, in ledger: inout Ledger) {
+        ledger.apps[owner, default: Tally()].bytes += write.bytes
+        ledger.apps[owner, default: Tally()].writes += 1
+
+        guard !write.path.isEmpty else { return }
+        var file = ledger.files[write.path] ?? FileTally()
+        file.bytes += write.bytes
+        file.writes += 1
+        file.owner = owner
+        ledger.files[write.path] = file
+        if ledger.files.count > fileCapacity { prune(&ledger) }
+    }
+
+    /// Without root, per-process counters are all that is available: no file or device detail, so
+    /// RAM disk writes can't be told apart here.
     public func addProcessBytes(name: String, bytes: Int) {
         guard bytes > 0 else { return }
         lock.lock()
         defer { lock.unlock() }
         let owner = Attribution.displayName(forProcess: name)
-        apps[owner, default: Tally()].bytes += bytes
-        apps[owner, default: Tally()].writes += 1
+        disk.apps[owner, default: Tally()].bytes += bytes
+        disk.apps[owner, default: Tally()].writes += 1
         tracedBytes += bytes
     }
 
     public func reset() {
         lock.lock()
         defer { lock.unlock() }
-        apps = [:]
-        files = [:]
+        disk = Ledger()
+        ram = Ledger()
         directWriters = [:]
         log = []
         logStart = 0
         droppedLogEntries = 0
         droppedFileBytes = 0
         tracedBytes = 0
+        ramDiskBytes = 0
         writeCount = 0
         flushedBytes = 0
         ownFlushedBytes = 0
@@ -142,18 +181,13 @@ public final class CaptureStore: @unchecked Sendable {
     public func snapshot(top: Int) -> CaptureSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        let topApps = apps
-            .map { RankedApp(name: $0.key, bytes: $0.value.bytes, writes: $0.value.writes) }
-            .sorted { ($0.bytes, $1.name) > ($1.bytes, $0.name) }
-            .prefix(top)
-        let topFiles = files
-            .map { RankedFile(path: $0.key, owner: $0.value.owner, bytes: $0.value.bytes, writes: $0.value.writes) }
-            .sorted { ($0.bytes, $1.path) > ($1.bytes, $0.path) }
-            .prefix(top)
         return CaptureSnapshot(
-            apps: Array(topApps),
-            files: Array(topFiles),
+            apps: disk.rankedApps(top: top),
+            files: disk.rankedFiles(top: top),
+            ramApps: ram.rankedApps(top: top),
+            ramFiles: ram.rankedFiles(top: top),
             tracedBytes: tracedBytes,
+            ramDiskBytes: ramDiskBytes,
             writeCount: writeCount,
             flushedBytes: flushedBytes,
             logCount: log.count,
@@ -172,12 +206,12 @@ public final class CaptureStore: @unchecked Sendable {
     public func logCSV() -> Data {
         lock.lock()
         defer { lock.unlock() }
-        var out = "time,bytes,app,process,thread,operation,flags,path\n"
+        var out = "time,bytes,storage,device,app,process,thread,operation,flags,path\n"
         for entry in orderedLog() {
             let write = entry.write
             let fields = [
-                write.timestamp, String(write.bytes), entry.owner, write.process, write.threadID,
-                write.operation, write.flags, write.path,
+                write.timestamp, String(write.bytes), Self.storageName(onRAMDisk: entry.onRAMDisk), write.device,
+                entry.owner, write.process, write.threadID, write.operation, write.flags, write.path,
             ]
             out += fields.map(Self.csvField).joined(separator: ",") + "\n"
         }
@@ -187,20 +221,27 @@ public final class CaptureStore: @unchecked Sendable {
     public func totalsCSV() -> Data {
         lock.lock()
         defer { lock.unlock() }
-        var out = "kind,name,app,bytes,writes\n"
-        for (name, tally) in apps.sorted(by: { $0.value.bytes > $1.value.bytes }) {
-            out += ["app", name, name, String(tally.bytes), String(tally.writes)]
-                .map(Self.csvField).joined(separator: ",") + "\n"
-        }
-        for (path, tally) in files.sorted(by: { $0.value.bytes > $1.value.bytes }) {
-            out += ["file", path, tally.owner, String(tally.bytes), String(tally.writes)]
-                .map(Self.csvField).joined(separator: ",") + "\n"
+        var out = "kind,storage,name,app,bytes,writes\n"
+        for (ledger, onRAMDisk) in [(disk, false), (ram, true)] {
+            let storage = Self.storageName(onRAMDisk: onRAMDisk)
+            for (name, tally) in ledger.apps.sorted(by: { $0.value.bytes > $1.value.bytes }) {
+                out += ["app", storage, name, name, String(tally.bytes), String(tally.writes)]
+                    .map(Self.csvField).joined(separator: ",") + "\n"
+            }
+            for (path, tally) in ledger.files.sorted(by: { $0.value.bytes > $1.value.bytes }) {
+                out += ["file", storage, path, tally.owner, String(tally.bytes), String(tally.writes)]
+                    .map(Self.csvField).joined(separator: ",") + "\n"
+            }
         }
         if droppedFileBytes > 0 {
-            out += ["file", "(smaller files dropped to bound memory)", "", String(droppedFileBytes), ""]
+            out += ["file", "", "(smaller files dropped to bound memory)", "", String(droppedFileBytes), ""]
                 .map(Self.csvField).joined(separator: ",") + "\n"
         }
         return Data(out.utf8)
+    }
+
+    private static func storageName(onRAMDisk: Bool) -> String {
+        onRAMDisk ? "RAM disk" : "Disk"
     }
 
     private func append(_ entry: LogEntry) {
@@ -217,15 +258,15 @@ public final class CaptureStore: @unchecked Sendable {
         logStart == 0 ? log[...] : (log[logStart...] + log[..<logStart])[...]
     }
 
-    /// Forgets the smaller half of the file table. Anything big enough to rank survives.
-    private func pruneFiles() {
-        let keep = files.sorted { $0.value.bytes > $1.value.bytes }.prefix(fileCapacity / 2)
+    /// Forgets the smaller half of a file table. Anything big enough to rank survives.
+    private func prune(_ ledger: inout Ledger) {
+        let keep = ledger.files.sorted { $0.value.bytes > $1.value.bytes }.prefix(fileCapacity / 2)
         let kept = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
-        for (path, tally) in files where kept[path] == nil {
+        for (path, tally) in ledger.files where kept[path] == nil {
             droppedFileBytes += tally.bytes
             directWriters[path] = nil
         }
-        files = kept
+        ledger.files = kept
     }
 
     private static func csvField(_ value: String) -> String {

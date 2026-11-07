@@ -7,10 +7,12 @@ public struct RawWrite: Equatable, Sendable {
     public var path: String
     public var process: String
     public var threadID: String
+    /// The BSD device written to, such as `disk3s5`.
+    public var device: String
 
     public init(
         timestamp: String, operation: String, flags: String, bytes: Int,
-        path: String, process: String, threadID: String
+        path: String, process: String, threadID: String, device: String = ""
     ) {
         self.timestamp = timestamp
         self.operation = operation
@@ -19,6 +21,7 @@ public struct RawWrite: Equatable, Sendable {
         self.path = path
         self.process = process
         self.threadID = threadID
+        self.device = device
     }
 }
 
@@ -53,6 +56,7 @@ public enum FSUsageParser {
         }
 
         index = skipBlanks(line, from: index, end: end)
+        let deviceStart = index
         let deviceEnd = tokenEnd(line, from: index, end: end)
         // Writes to /dev/null and similar never reach a disk.
         if starts(line, with: "/dev/NOTFOUND", at: index) { return nil }
@@ -90,7 +94,8 @@ public enum FSUsageParser {
             bytes: bytes,
             path: normalize(path: text(line, pathStart, pathEnd)),
             process: text(line, processStart, separator),
-            threadID: text(line, separator + 1, end)
+            threadID: text(line, separator + 1, end),
+            device: deviceName(text(line, deviceStart, deviceEnd))
         )
     }
 
@@ -105,6 +110,10 @@ public enum FSUsageParser {
             return "/" + path.dropFirst(dataVolumePrefix.count)
         }
         return path
+    }
+
+    private static func deviceName(_ token: String) -> String {
+        token.hasPrefix("/dev/") ? String(token.dropFirst(5)) : token
     }
 
     private static func isBlank(_ byte: UInt8) -> Bool {

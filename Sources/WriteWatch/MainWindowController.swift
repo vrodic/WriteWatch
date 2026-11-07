@@ -28,6 +28,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     private let store = CaptureStore()
     private let counters = DiskCounters()
     private let sampler = ProcessSampler()
+    private let classifier = DeviceClassifier()
 
     private var helper: HelperConnection?
     private var access = Access.none
@@ -48,16 +49,20 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     private let peakTile = TileView(title: "Peak this capture")
     private let captureTile = TileView(title: "Written this capture")
     private let bootTile = TileView(title: "Written since boot")
-    private let ownTile = TileView(title: "WriteWatch's own disk writes")
+    private let ramTile = TileView(title: "To RAM disks")
+    private let ownTile = TileView(title: "Own disk writes")
 
     private let chart = RateChartView()
     private let appsList = BarListView()
     private let filesList = BarListView()
+    private let ramAppsList = BarListView()
+    private let ramFilesList = BarListView()
+    private let ramPane = NSStackView()
     private let logPane = LogPane()
     private let healthPane = HealthPane()
     private let writersPane = NSStackView()
     private let segments = NSSegmentedControl(
-        labels: ["Top Writers", "Large Writes", "SSD Health"], trackingMode: .selectOne, target: nil, action: nil)
+        labels: ["Top Writers", "RAM Disks", "Large Writes", "SSD Health"], trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
 
     private let captureButton = NSButton(title: "", target: nil, action: nil)
@@ -151,13 +156,20 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         let root = BackgroundView()
         window.contentView = root
 
-        let tiles = NSStackView(views: [rateTile, peakTile, captureTile, bootTile, ownTile])
+        let tiles = NSStackView(views: [rateTile, peakTile, captureTile, bootTile, ramTile, ownTile])
         tiles.orientation = .horizontal
         tiles.distribution = .fillEqually
         tiles.spacing = 10
 
-        appsList.title = "Apps writing the most"
-        filesList.title = "Files written the most"
+        appsList.title = "Apps writing the most to disk"
+        filesList.title = "Files written the most on disk"
+        ramAppsList.title = "Apps writing the most to RAM disks"
+        ramFilesList.title = "Files written the most on RAM disks"
+        ramPane.orientation = .horizontal
+        ramPane.distribution = .fillEqually
+        ramPane.spacing = 28
+        ramPane.addArrangedSubview(ramAppsList)
+        ramPane.addArrangedSubview(ramFilesList)
         writersPane.orientation = .horizontal
         writersPane.distribution = .fillEqually
         writersPane.spacing = 28
@@ -169,7 +181,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         segments.action = #selector(paneChanged)
 
         let panes = NSView()
-        for pane in [writersPane, logPane, healthPane] as [NSView] {
+        for pane in [writersPane, ramPane, logPane, healthPane] as [NSView] {
             pane.translatesAutoresizingMaskIntoConstraints = false
             panes.addSubview(pane)
             NSLayoutConstraint.activate([
@@ -179,6 +191,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
                 pane.trailingAnchor.constraint(equalTo: panes.trailingAnchor),
             ])
         }
+        ramPane.isHidden = true
         logPane.isHidden = true
         healthPane.isHidden = true
         healthPane.onRefresh = { [weak self] in self?.readHealth() }
@@ -257,6 +270,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         }
 
         rateTile.update(value: ByteFormat.string(rate) + "/s", caption: "internal SSD")
+        if Int(now.timeIntervalSince1970) % 5 == 0 { classifier.refresh() }
         peakTile.update(value: ByteFormat.string(peakRate) + "/s", caption: isCapturing ? "capturing" : "not capturing")
         captureTile.update(value: ByteFormat.string(Double(captureDiskBytes)), caption: Self.durationText(captureSeconds))
         bootTile.update(value: total.map { ByteFormat.string(Double($0)) } ?? "–", caption: Self.perDayText(total))
@@ -271,20 +285,35 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
 
     private func refreshCaptureViews(memory: UInt64) {
         let snapshot = store.snapshot(top: 15)
+        let ramBytesByApp = Dictionary(uniqueKeysWithValues: snapshot.ramApps.map { ($0.name, $0.bytes) })
 
         appsList.update(
-            rows: snapshot.apps.map {
+            rows: snapshot.apps.map { app in
+                var detail = ""
+                var tooltip = "\(app.name)\n\(ByteFormat.string(app.bytes)) to disk in \(app.writes) writes"
+                if let ram = ramBytesByApp[app.name] {
+                    detail = "+\(ByteFormat.string(ram)) on RAM disk"
+                    tooltip += "\n\(ByteFormat.string(ram)) more to RAM disks, which never reaches the SSD"
+                }
+                return BarListView.Row(title: app.name, detail: detail, bytes: app.bytes, tooltip: tooltip)
+            })
+        filesList.update(rows: snapshot.files.map(Self.fileRow))
+        ramAppsList.update(
+            rows: snapshot.ramApps.map {
                 BarListView.Row(
                     title: $0.name, detail: "", bytes: $0.bytes,
-                    tooltip: "\($0.name)\n\(ByteFormat.string($0.bytes)) in \($0.writes) writes")
+                    tooltip: "\($0.name)\n\(ByteFormat.string($0.bytes)) to RAM disks in \($0.writes) writes")
             })
-        filesList.update(
-            rows: snapshot.files.map {
-                let name = ($0.path as NSString).lastPathComponent
-                return BarListView.Row(
-                    title: name, detail: $0.owner, bytes: $0.bytes,
-                    tooltip: "\($0.path)\n\($0.owner): \(ByteFormat.string($0.bytes)) in \($0.writes) writes")
-            })
+        ramFilesList.update(rows: snapshot.ramFiles.map(Self.fileRow))
+        let noRAMWrites = access == .granted || access == .requesting
+            ? "No RAM disk writes in this capture." : "Telling RAM disks apart needs administrator access."
+        ramAppsList.emptyMessage = noRAMWrites
+        ramFilesList.emptyMessage = noRAMWrites
+        if access == .granted {
+            ramTile.update(value: ByteFormat.string(snapshot.ramDiskBytes), caption: "never reach the SSD")
+        } else {
+            ramTile.update(value: "–", caption: "needs Full Access")
+        }
         appsList.emptyMessage = isCapturing ? "Waiting for writes…" : "Start a capture to rank apps by writes."
         filesList.emptyMessage = access == .granted || access == .requesting
             ? (isCapturing ? "Waiting for writes…" : "Start a capture to rank files by writes.")
@@ -307,6 +336,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         statusLabel.stringValue = parts.joined(separator: "  ·  ")
         saveButton.isEnabled = snapshot.tracedBytes > 0 || snapshot.logCount > 0
         clearButton.isEnabled = saveButton.isEnabled
+    }
+
+    private static func fileRow(_ file: RankedFile) -> BarListView.Row {
+        BarListView.Row(
+            title: (file.path as NSString).lastPathComponent, detail: file.owner, bytes: file.bytes,
+            tooltip: "\(file.path)\n\(file.owner): \(ByteFormat.string(file.bytes)) in \(file.writes) writes")
     }
 
     private static func durationText(_ seconds: Double) -> String {
@@ -392,7 +427,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         updateControls()
 
         let connection = HelperConnection()
-        connection.onWrite = { [store] write in store.ingest(write) }
+        connection.onWrite = { [store, classifier] write in
+            store.ingest(write, onRAMDisk: classifier.isRAMDisk(write.device))
+        }
         connection.onDiagnostic = { [weak self] text in self?.handleDiagnostic(text) }
         connection.onConnected = { [weak self] in
             guard let self else { return }
@@ -507,9 +544,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     @objc private func paneChanged() {
         let selected = segments.selectedSegment
         writersPane.isHidden = selected != 0
-        logPane.isHidden = selected != 1
-        healthPane.isHidden = selected != 2
-        if selected == 1 { logPane.update(entries: store.recentLog(limit: LogPane.displayLimit)) }
+        ramPane.isHidden = selected != 1
+        logPane.isHidden = selected != 2
+        healthPane.isHidden = selected != 3
+        if selected == 2 { logPane.update(entries: store.recentLog(limit: LogPane.displayLimit)) }
     }
 
     // MARK: - Save, clear, quit
@@ -632,7 +670,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
         access = .granted
         for line in text.split(separator: "\n") {
-            if let write = FSUsageParser.parse(String(line)) { store.ingest(write) }
+            if let write = FSUsageParser.parse(String(line)) {
+                store.ingest(write, onRAMDisk: classifier.isRAMDisk(write.device))
+            }
         }
         peakRate = 1_200_000
         captureDiskBytes = 152_092_672
